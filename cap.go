@@ -51,9 +51,27 @@ type Solution struct {
 
 // CapConfig contains the main configuration for the Cap instance
 type CapConfig struct {
-	TokensStorePath string          `json:"tokensStorePath,omitempty"` // Path to store tokens file
+	TokensStorePath string          `json:"tokensStorePath,omitempty"` // Path to store tokens file, absolute path recommended
 	State           *ChallengeState `json:"state,omitempty"`           // State configuration
-	NoFSState       bool            `json:"noFSState,omitempty"`       // Whether to disable file-based state storage
+
+	// EnableFSState turns on file-based token persistence (default: false).
+	// Since v1.0.1 persistence is opt-in: unless this is set, Cap never touches
+	// the filesystem, so no directory or file is created on New().
+	EnableFSState bool `json:"enableFSState,omitempty"`
+
+	// Deprecated: kept for backward compatibility only. Setting it to true still
+	// force-disables persistence; setting it to false no longer enables it.
+	// Use EnableFSState instead.
+	NoFSState bool `json:"noFSState,omitempty"`
+
+	// SaveThrottleMs is the minimum interval between two disk writes, in
+	// milliseconds. 0 uses DefaultSaveThrottleMs, a negative value writes on
+	// every change. Pending changes are flushed by Flush() or Cleanup().
+	SaveThrottleMs int `json:"saveThrottleMs,omitempty"`
+
+	// Logger receives diagnostic messages. When nil, Cap stays completely
+	// silent instead of writing to stdout.
+	Logger func(format string, args ...interface{}) `json:"-"`
 }
 
 // ChallengeResponse represents the response from CreateChallenge
@@ -80,22 +98,33 @@ type ValidationResponse struct {
 type Cap struct {
 	config *CapConfig
 	mu     sync.RWMutex
+
+	fsEnabled bool          // whether token state is persisted to disk
+	throttle  time.Duration // minimum interval between two disk writes
+	lastSave  time.Time     // when the last successful write happened
+	dirty     bool          // there are in-memory changes not yet written
 }
 
 const (
+	// Version is the released version of this library.
+	Version = "1.0.1"
+
 	DefaultTokensStore         = ".data/tokensList.json"
 	DefaultChallengeCount      = 50
 	DefaultChallengeSize       = 32
 	DefaultChallengeDifficulty = 4
 	DefaultExpiresMs           = 600000  // 10 minutes
 	DefaultTokenExpiresMs      = 1200000 // 20 minutes
+	DefaultSaveThrottleMs      = 2000    // coalesce disk writes within 2 seconds
 )
 
-// New creates a new Cap instance with the given configuration
+// New creates a new Cap instance with the given configuration.
+//
+// File persistence is opt-in: without CapConfig.EnableFSState, New touches no
+// file or directory at all and all state is kept in memory.
 func New(configObj *CapConfig) *Cap {
 	config := &CapConfig{
 		TokensStorePath: DefaultTokensStore,
-		NoFSState:       false,
 		State: &ChallengeState{
 			ChallengesList: make(map[string]*ChallengeData),
 			TokensList:     make(map[string]int64),
@@ -106,19 +135,38 @@ func New(configObj *CapConfig) *Cap {
 		if configObj.TokensStorePath != "" {
 			config.TokensStorePath = configObj.TokensStorePath
 		}
-		if configObj.NoFSState {
-			config.NoFSState = configObj.NoFSState
-		}
+		config.EnableFSState = configObj.EnableFSState
+		config.NoFSState = configObj.NoFSState
+		config.SaveThrottleMs = configObj.SaveThrottleMs
+		config.Logger = configObj.Logger
 		if configObj.State != nil {
 			config.State = configObj.State
 		}
 	}
 
-	cap := &Cap{
-		config: config,
+	// A caller-supplied State may carry nil maps, guard against writing to them.
+	if config.State.ChallengesList == nil {
+		config.State.ChallengesList = make(map[string]*ChallengeData)
+	}
+	if config.State.TokensList == nil {
+		config.State.TokensList = make(map[string]int64)
 	}
 
-	if !config.NoFSState {
+	cap := &Cap{
+		config:    config,
+		fsEnabled: config.EnableFSState && !config.NoFSState,
+	}
+
+	switch {
+	case config.SaveThrottleMs < 0:
+		cap.throttle = 0
+	case config.SaveThrottleMs == 0:
+		cap.throttle = DefaultSaveThrottleMs * time.Millisecond
+	default:
+		cap.throttle = time.Duration(config.SaveThrottleMs) * time.Millisecond
+	}
+
+	if cap.fsEnabled {
 		cap.loadTokens()
 	}
 
@@ -290,12 +338,7 @@ func (c *Cap) RedeemChallenge(solution *Solution) (*RedeemResponse, error) {
 	key := fmt.Sprintf("%s:%s", id, hashHex)
 	c.config.State.TokensList[key] = expires
 
-	if !c.config.NoFSState {
-		if err := c.saveTokens(); err != nil {
-			// Log error but don't fail the operation
-			fmt.Printf("Warning: failed to save tokens: %v\n", err)
-		}
-	}
+	c.persist()
 
 	return &RedeemResponse{
 		Success: true,
@@ -324,13 +367,7 @@ func (c *Cap) ValidateToken(token string, conf *TokenConfig) (*ValidationRespons
 	if _, exists := c.config.State.TokensList[key]; exists {
 		if conf == nil || !conf.KeepToken {
 			delete(c.config.State.TokensList, key)
-		}
-
-		if !c.config.NoFSState {
-			if err := c.saveTokens(); err != nil {
-				// Log error but don't fail the operation
-				fmt.Printf("Warning: failed to save tokens: %v\n", err)
-			}
+			c.persist()
 		}
 
 		return &ValidationResponse{Success: true}, nil
@@ -344,40 +381,57 @@ func (c *Cap) Cleanup() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	tokensChanged := c.cleanExpiredTokens()
-
-	if tokensChanged && !c.config.NoFSState {
-		return c.saveTokens()
+	if c.cleanExpiredTokens() {
+		c.dirty = true
 	}
 
-	return nil
+	if !c.fsEnabled || !c.dirty {
+		return nil
+	}
+
+	return c.saveTokens()
 }
 
-// loadTokens loads tokens from the storage file
-func (c *Cap) loadTokens() {
-	dirPath := filepath.Dir(c.config.TokensStorePath)
-	if dirPath != "." {
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			fmt.Printf("Warning: couldn't create tokens directory: %v\n", err)
-			return
-		}
+// Flush writes any pending token changes to disk right away, ignoring the
+// throttle interval. It is a no-op when persistence is disabled or when there
+// is nothing to write. Call it before shutting down so throttled changes are
+// not lost.
+func (c *Cap) Flush() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.fsEnabled || !c.dirty {
+		return nil
 	}
 
+	return c.saveTokens()
+}
+
+// logf reports a diagnostic message through the injected logger. Without a
+// logger the library stays silent rather than writing to stdout.
+func (c *Cap) logf(format string, args ...interface{}) {
+	if c.config.Logger != nil {
+		c.config.Logger(format, args...)
+	}
+}
+
+// loadTokens loads tokens from the storage file. A missing file is not an
+// error: the state stays empty and the file is created on the first write.
+func (c *Cap) loadTokens() {
 	data, err := os.ReadFile(c.config.TokensStorePath)
 	if err != nil {
-		// File doesn't exist, create empty one
-		fmt.Printf("[cap] Tokens file not found, creating a new empty one\n")
-		if err := os.WriteFile(c.config.TokensStorePath, []byte("{}"), 0644); err != nil {
-			fmt.Printf("Warning: couldn't create tokens file: %v\n", err)
+		if !os.IsNotExist(err) {
+			c.logf("cap: couldn't read tokens file %s: %v", c.config.TokensStorePath, err)
 		}
-		c.config.State.TokensList = make(map[string]int64)
 		return
 	}
 
 	var tokensList map[string]int64
 	if err := json.Unmarshal(data, &tokensList); err != nil {
-		fmt.Printf("Warning: couldn't parse tokens file, using empty state: %v\n", err)
-		c.config.State.TokensList = make(map[string]int64)
+		c.logf("cap: couldn't parse tokens file %s, using empty state: %v", c.config.TokensStorePath, err)
+		return
+	}
+	if tokensList == nil { // file contained "null"
 		return
 	}
 
@@ -385,14 +439,52 @@ func (c *Cap) loadTokens() {
 	c.cleanExpiredTokens()
 }
 
-// saveTokens saves tokens to the storage file
+// persist records a state change and writes it out, unless another write
+// happened within the throttle window. Callers must hold the lock.
+func (c *Cap) persist() {
+	if !c.fsEnabled {
+		return
+	}
+
+	c.dirty = true
+	if c.throttle > 0 && time.Since(c.lastSave) < c.throttle {
+		return // coalesced, Flush() or a later change writes it out
+	}
+
+	if err := c.saveTokens(); err != nil {
+		c.logf("cap: failed to save tokens: %v", err)
+	}
+}
+
+// saveTokens atomically writes the tokens to the storage file. The file is
+// written to a temporary sibling first and then renamed, so a crash can never
+// leave a half-written file behind. Callers must hold the lock.
 func (c *Cap) saveTokens() error {
 	data, err := json.Marshal(c.config.State.TokensList)
 	if err != nil {
 		return fmt.Errorf("failed to marshal tokens: %w", err)
 	}
 
-	return os.WriteFile(c.config.TokensStorePath, data, 0644)
+	storePath := c.config.TokensStorePath
+	if dirPath := filepath.Dir(storePath); dirPath != "." && dirPath != "" {
+		if err := os.MkdirAll(dirPath, 0700); err != nil {
+			return fmt.Errorf("failed to create tokens directory: %w", err)
+		}
+	}
+
+	tmpPath := storePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("failed to write tokens file: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, storePath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to replace tokens file: %w", err)
+	}
+
+	c.lastSave = time.Now()
+	c.dirty = false
+	return nil
 }
 
 // cleanExpiredTokens removes expired tokens and challenges from memory

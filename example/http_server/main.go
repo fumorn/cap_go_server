@@ -17,7 +17,8 @@ func main() {
 	// Initialize the cap server
 	config := &capserver.CapConfig{
 		TokensStorePath: "./example_tokens.json",
-		NoFSState:       false, // Enable file-based storage
+		EnableFSState:   true, // Opt in to file-based storage
+		Logger:          log.Printf,
 	}
 
 	capServer := capserver.New(config)

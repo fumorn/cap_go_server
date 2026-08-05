@@ -17,7 +17,32 @@ Cap Go Server is a Go port of the original JavaScript Cap server library. It pro
 - **Lightweight**: Minimal dependencies and efficient implementation
 - **Configurable**: Customizable challenge difficulty, expiration times, and storage options
 - **Token Management**: Secure token generation, validation, and cleanup
-- **File-based Persistence**: Optional file-based token storage with automatic cleanup
+- **Memory-only by default**: Never touches the filesystem unless you ask it to
+- **File-based Persistence**: Opt-in token storage with throttled, atomic writes
+
+## Upgrading to v1.0.1
+
+**Behaviour change**: file persistence is now opt-in.
+
+Before v1.0.1 the zero-value config enabled it, so `New()` immediately created a
+`.data/tokensList.json` under the *process working directory* — which is not
+necessarily the program directory when running as a service. Every redeem and
+validate then rewrote the whole file non-atomically, and status messages went
+straight to stdout.
+
+| | v1.0.0 | v1.0.1 |
+|---|---|---|
+| Default persistence | on | **off** |
+| Enable persistence | `NoFSState: false` | `EnableFSState: true` |
+| Disable persistence | `NoFSState: true` | default (or `NoFSState: true`) |
+| File created on `New()` | always | only on the first token write |
+| Disk writes | every redeem/validate | throttled, `tmp` + atomic rename |
+| Diagnostics | `fmt.Printf` to stdout | injected `Logger`, silent when nil |
+
+If you relied on persistence, replace `NoFSState: false` with
+`EnableFSState: true` and set `TokensStorePath` to an absolute path. Call
+`Flush()` before shutdown so throttled changes are not lost. `NoFSState: true`
+keeps working and still wins over `EnableFSState`.
 
 ## Installation
 
@@ -38,12 +63,9 @@ import (
 )
 
 func main() {
-    // Initialize Cap server with default configuration
-    config := &capserver.CapConfig{
-        TokensStorePath: "./tokens.json",
-        NoFSState:       false,
-    }
-    cap := capserver.New(config)
+    // Initialize Cap server. Without EnableFSState everything is kept in
+    // memory and no file is ever created.
+    cap := capserver.New(nil)
 
     // Create a challenge
     challengeConfig := &capserver.ChallengeConfig{
@@ -122,8 +144,11 @@ Represents a solution to a challenge:
 
 #### `CapConfig`
 Main configuration for the Cap instance:
-- `TokensStorePath`: Path to store tokens file (default: ".data/tokensList.json")
-- `NoFSState`: Whether to disable file-based state storage (default: false)
+- `TokensStorePath`: Path to store tokens file (default: ".data/tokensList.json", **absolute path recommended** — a relative path resolves against the process working directory)
+- `EnableFSState`: Opt in to file-based token persistence (default: false)
+- `SaveThrottleMs`: Minimum interval between two disk writes in milliseconds (default: 2000; negative writes on every change)
+- `Logger`: `func(format string, args ...interface{})` receiving diagnostics; when nil the library prints nothing
+- `NoFSState`: *Deprecated*. `true` still force-disables persistence; `false` no longer enables it — use `EnableFSState`
 
 ### Methods
 
@@ -141,6 +166,11 @@ Validates a verification token.
 
 #### `Cleanup() error`
 Cleans up expired tokens and syncs state to disk.
+
+#### `Flush() error`
+Writes pending token changes to disk immediately, ignoring the throttle
+interval. No-op when persistence is disabled or nothing changed. Call it before
+shutting down.
 
 ## Configuration
 
@@ -162,11 +192,14 @@ challenge, err := cap.CreateChallenge(config)
 
 ```go
 config := &capserver.CapConfig{
-    TokensStorePath: "./tokens/tokens.json",
-    NoFSState:       false, // Enable file-based storage
+    TokensStorePath: "/var/lib/myapp/tokens.json", // absolute path recommended
+    EnableFSState:   true,                         // opt in to file-based storage
+    SaveThrottleMs:  2000,                         // coalesce writes within 2s
+    Logger:          log.Printf,                   // nil keeps the library silent
 }
 
 cap := capserver.New(config)
+defer cap.Flush() // write out throttled changes before exiting
 ```
 
 ## Security Considerations
@@ -174,7 +207,8 @@ cap := capserver.New(config)
 - Challenges expire automatically to prevent replay attacks
 - Tokens are cryptographically secure and include random components
 - SHA-256 hashing ensures computational difficulty for bots
-- File-based storage includes proper error handling and recovery
+- Only `sha256(token)` is persisted, never the token itself; the store file is created with `0600` and its directory with `0700`
+- Writes go through a temporary file and an atomic rename, so a crash cannot leave a truncated store behind
 
 ## License
 

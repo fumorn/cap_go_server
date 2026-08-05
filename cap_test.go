@@ -3,8 +3,10 @@ package capserver
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,9 @@ func TestNew(t *testing.T) {
 	if cap.config.TokensStorePath != DefaultTokensStore {
 		t.Errorf("Expected default tokens store path %s, got %s", DefaultTokensStore, cap.config.TokensStorePath)
 	}
+	if cap.fsEnabled {
+		t.Error("Expected file persistence to be disabled by default")
+	}
 
 	// Test with custom config
 	customConfig := &CapConfig{
@@ -31,6 +36,192 @@ func TestNew(t *testing.T) {
 	}
 	if !cap2.config.NoFSState {
 		t.Error("Expected NoFSState to be true")
+	}
+	if cap2.fsEnabled {
+		t.Error("Expected file persistence to stay disabled when NoFSState is set")
+	}
+
+	// EnableFSState opts in, NoFSState still wins for backward compatibility
+	cap3 := New(&CapConfig{TokensStorePath: "./test_tokens.json", EnableFSState: true})
+	if !cap3.fsEnabled {
+		t.Error("Expected file persistence to be enabled by EnableFSState")
+	}
+	cap4 := New(&CapConfig{TokensStorePath: "./test_tokens.json", EnableFSState: true, NoFSState: true})
+	if cap4.fsEnabled {
+		t.Error("Expected NoFSState to override EnableFSState")
+	}
+
+	// State with nil maps must not panic on use
+	cap5 := New(&CapConfig{State: &ChallengeState{}})
+	if _, err := cap5.CreateChallenge(&ChallengeConfig{ChallengeCount: 1, Store: true}); err != nil {
+		t.Fatalf("Failed to create challenge with empty state: %v", err)
+	}
+}
+
+// TestNewCreatesNoFilesByDefault guards the regression where New() eagerly
+// created a .data/tokensList.json under the process working directory.
+func TestNewCreatesNoFilesByDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get working directory: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Failed to change working directory: %v", err)
+	}
+	defer os.Chdir(origDir)
+
+	// Both the default config and the pre-v1.0.1 "NoFSState: false" spelling
+	// must leave the working directory untouched.
+	New(nil)
+	New(&CapConfig{NoFSState: false})
+
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to read temp dir: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("Expected no files to be created, got %v", names)
+	}
+}
+
+// TestNoEagerFileCreationWhenEnabled checks that even with persistence enabled
+// nothing is written until there is an actual token to store.
+func TestNoEagerFileCreationWhenEnabled(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "nested", "tokensList.json")
+
+	cap := New(&CapConfig{TokensStorePath: storePath, EnableFSState: true})
+
+	if _, err := os.Stat(filepath.Dir(storePath)); !os.IsNotExist(err) {
+		t.Error("Expected tokens directory not to be created on New()")
+	}
+
+	cap.mu.Lock()
+	cap.config.State.TokensList["k"] = time.Now().UnixMilli() + 60000
+	cap.persist()
+	cap.mu.Unlock()
+
+	if _, err := os.Stat(storePath); err != nil {
+		t.Errorf("Expected tokens file after the first write, got %v", err)
+	}
+}
+
+// TestSaveTokensIsAtomic verifies the temporary file is renamed into place and
+// never left behind.
+func TestSaveTokensIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "tokensList.json")
+
+	cap := New(&CapConfig{TokensStorePath: storePath, EnableFSState: true, SaveThrottleMs: -1})
+	cap.config.State.TokensList["test"] = time.Now().UnixMilli() + 60000
+	if err := cap.saveTokens(); err != nil {
+		t.Fatalf("Failed to save tokens: %v", err)
+	}
+
+	if _, err := os.Stat(storePath + ".tmp"); !os.IsNotExist(err) {
+		t.Error("Expected no leftover .tmp file")
+	}
+
+	data, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatalf("Failed to read tokens file: %v", err)
+	}
+	var loaded map[string]int64
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("Tokens file is not valid JSON: %v", err)
+	}
+	if _, exists := loaded["test"]; !exists {
+		t.Error("Expected the token to be present in the file")
+	}
+}
+
+// TestSaveThrottle checks that writes within the throttle window are coalesced
+// and that Flush() still gets them to disk.
+func TestSaveThrottle(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokensList.json")
+
+	cap := New(&CapConfig{TokensStorePath: storePath, EnableFSState: true, SaveThrottleMs: 60000})
+
+	cap.mu.Lock()
+	cap.config.State.TokensList["a"] = time.Now().UnixMilli() + 60000
+	cap.persist() // first write always goes through
+	cap.config.State.TokensList["b"] = time.Now().UnixMilli() + 60000
+	cap.persist() // throttled
+	dirty := cap.dirty
+	cap.mu.Unlock()
+
+	if !dirty {
+		t.Error("Expected the throttled change to be marked dirty")
+	}
+
+	data, _ := os.ReadFile(storePath)
+	var loaded map[string]int64
+	json.Unmarshal(data, &loaded)
+	if _, exists := loaded["b"]; exists {
+		t.Error("Expected the second change to be coalesced, not written")
+	}
+
+	if err := cap.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	data, _ = os.ReadFile(storePath)
+	loaded = nil
+	json.Unmarshal(data, &loaded)
+	if _, exists := loaded["b"]; !exists {
+		t.Error("Expected Flush to write the pending change")
+	}
+}
+
+// TestLoadTokensBadInput makes sure a missing, empty or corrupt file degrades
+// to an empty state instead of panicking.
+func TestLoadTokensBadInput(t *testing.T) {
+	dir := t.TempDir()
+
+	for name, content := range map[string]string{
+		"corrupt.json": "not json at all",
+		"null.json":    "null",
+		"empty.json":   "",
+	} {
+		storePath := filepath.Join(dir, name)
+		if err := os.WriteFile(storePath, []byte(content), 0600); err != nil {
+			t.Fatalf("Failed to write %s: %v", name, err)
+		}
+
+		cap := New(&CapConfig{TokensStorePath: storePath, EnableFSState: true})
+		if cap.config.State.TokensList == nil {
+			t.Fatalf("%s: expected non-nil tokens list", name)
+		}
+		if len(cap.config.State.TokensList) != 0 {
+			t.Errorf("%s: expected empty tokens list, got %d entries", name, len(cap.config.State.TokensList))
+		}
+		// Must not panic when writing into the recovered state.
+		cap.config.State.TokensList["k"] = time.Now().UnixMilli() + 60000
+	}
+}
+
+// TestSilentByDefault makes sure diagnostics only surface through an injected
+// logger.
+func TestSilentByDefault(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "corrupt.json")
+	if err := os.WriteFile(storePath, []byte("{oops"), 0600); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	var logged []string
+	New(&CapConfig{
+		TokensStorePath: storePath,
+		EnableFSState:   true,
+		Logger: func(format string, args ...interface{}) {
+			logged = append(logged, fmt.Sprintf(format, args...))
+		},
+	})
+
+	if len(logged) == 0 {
+		t.Error("Expected the injected logger to receive the parse failure")
 	}
 }
 
@@ -260,7 +451,7 @@ func TestFileOperations(t *testing.T) {
 
 	cap := New(&CapConfig{
 		TokensStorePath: testFile,
-		NoFSState:       false,
+		EnableFSState:   true,
 	})
 
 	// Add some tokens
@@ -281,7 +472,7 @@ func TestFileOperations(t *testing.T) {
 	// Create new instance and load tokens
 	cap2 := New(&CapConfig{
 		TokensStorePath: testFile,
-		NoFSState:       false,
+		EnableFSState:   true,
 	})
 
 	if len(cap2.config.State.TokensList) != 2 {
@@ -295,13 +486,94 @@ func TestFileOperations(t *testing.T) {
 	}
 }
 
+// TestRedeemAndValidateWithPersistence walks the full flow with persistence on
+// and checks the file tracks the token being issued and then consumed.
+func TestRedeemAndValidateWithPersistence(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokensList.json")
+	cap := New(&CapConfig{TokensStorePath: storePath, EnableFSState: true, SaveThrottleMs: -1})
+
+	challenge, err := cap.CreateChallenge(&ChallengeConfig{
+		ChallengeCount:      2,
+		ChallengeSize:       8,
+		ChallengeDifficulty: 1,
+		Store:               true,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create challenge: %v", err)
+	}
+
+	solutions := make([][]interface{}, 0, len(challenge.Challenge))
+	for _, ch := range challenge.Challenge {
+		salt, target := ch[0], ch[1]
+		found := false
+		for nonce := 0; nonce < 1000000; nonce++ {
+			hash := sha256.Sum256([]byte(fmt.Sprintf("%s%d", salt, nonce)))
+			if strings.HasPrefix(hex.EncodeToString(hash[:]), target) {
+				solutions = append(solutions, []interface{}{salt, target, nonce})
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("No solution found for salt %s target %s", salt, target)
+		}
+	}
+
+	redeem, err := cap.RedeemChallenge(&Solution{Token: challenge.Token, Solutions: solutions})
+	if err != nil {
+		t.Fatalf("Failed to redeem challenge: %v", err)
+	}
+	if !redeem.Success {
+		t.Fatalf("Expected redeem to succeed, got %q", redeem.Message)
+	}
+
+	readStore := func() map[string]int64 {
+		data, err := os.ReadFile(storePath)
+		if err != nil {
+			t.Fatalf("Failed to read tokens file: %v", err)
+		}
+		var m map[string]int64
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatalf("Tokens file is not valid JSON: %v", err)
+		}
+		return m
+	}
+
+	if len(readStore()) != 1 {
+		t.Errorf("Expected the issued token to be persisted, got %v", readStore())
+	}
+
+	// A fresh instance must pick the token up from disk.
+	cap2 := New(&CapConfig{TokensStorePath: storePath, EnableFSState: true, SaveThrottleMs: -1})
+	result, err := cap2.ValidateToken(redeem.Token, nil)
+	if err != nil {
+		t.Fatalf("Failed to validate token: %v", err)
+	}
+	if !result.Success {
+		t.Fatal("Expected the reloaded token to validate")
+	}
+
+	if len(readStore()) != 0 {
+		t.Errorf("Expected the consumed token to be removed from disk, got %v", readStore())
+	}
+
+	// Second use of the same token must fail.
+	result, err = cap2.ValidateToken(redeem.Token, nil)
+	if err != nil {
+		t.Fatalf("Failed to validate token: %v", err)
+	}
+	if result.Success {
+		t.Error("Expected a consumed token to be rejected")
+	}
+}
+
 func TestCleanup(t *testing.T) {
 	testFile := "./test_cleanup_tokens.json"
 	defer os.Remove(testFile) // Clean up
 
 	cap := New(&CapConfig{
 		TokensStorePath: testFile,
-		NoFSState:       false,
+		EnableFSState:   true,
 	})
 
 	// Add expired and valid tokens

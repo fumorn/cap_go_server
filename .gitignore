@@ -38,6 +38,9 @@ Thumbs.db
 tokens.json
 test_*.json
 *.json.bak
+*.json.tmp
+.data/
+example_tokens.json
 
 # Log files
 *.log
